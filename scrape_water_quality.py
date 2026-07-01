@@ -34,7 +34,7 @@ PAGE_DELAY = 2  # 每页请求间隔秒数（避免请求过快）
 
 # Git 自动提交配置
 GIT_AUTO_COMMIT = True  # 是否自动 git commit
-GIT_AUTO_PUSH = False   # 是否自动 git push（需先配置 remote）
+GIT_AUTO_PUSH = True    # 是否自动 git push（需先配置 remote）
 PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 HEADERS = {
