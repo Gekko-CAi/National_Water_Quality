@@ -399,9 +399,10 @@ def git_commit_and_push(filepath):
     def run_git(cmd):
         try:
             result = subprocess.run(
-                cmd, cwd=PROJECT_DIR, capture_output=True, text=True, timeout=30
+                cmd, cwd=PROJECT_DIR, capture_output=True, text=True, timeout=30,
+                encoding='utf-8', errors='replace'
             )
-            return result.returncode == 0, result.stdout.strip(), result.stderr.strip()
+            return result.returncode == 0, (result.stdout or "").strip(), (result.stderr or "").strip()
         except Exception as e:
             return False, "", str(e)
 
