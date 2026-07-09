@@ -2,7 +2,7 @@ name: 水质数据抓取
 
 on:
   schedule:
-    # 每2小时运行一次（UTC 时间）
+    # 每2小时运行一次（UTC 时间，对应北京时间偶数点整点）
     - cron: '0 */2 * * *'
   workflow_dispatch: # 支持手动触发
 
@@ -35,16 +35,10 @@ jobs:
           python-version: '3.12'
 
       - name: 安装依赖
-        run: pip install requests urllib3 openpyxl
+        run: pip install requests urllib3
 
       - name: 运行抓取脚本
         run: python scrape_water_quality.py
-
-      - name: 清理旧数据文件（只保留最新一份）
-        run: |
-          cd 数据文件
-          ls -t *.xlsx 2>/dev/null | tail -n +2 | xargs -r rm -f
-          cd ..
 
       - name: 提交并推送变更到 data 分支
         run: |
@@ -52,6 +46,6 @@ jobs:
           if git diff --cached --quiet; then
             echo "无变化，跳过提交"
           else
-            git commit -m "水质数据更新：清理历史文件，保留最新一份"
+            git commit -m "水质数据按天更新（北京时间CSV）"
           fi
           git push origin HEAD:data
