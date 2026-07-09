@@ -12,16 +12,8 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout data 分支
+      - name: Checkout 主分支
         uses: actions/checkout@v4
-        with:
-          ref: data
-          fetch-depth: 0
-
-      - name: 从 main 分支同步最新脚本
-        run: |
-          git fetch origin main
-          git checkout origin/main -- scrape_water_quality.py requirements.txt
 
       - name: 配置 Git
         run: |
@@ -38,7 +30,7 @@ jobs:
       - name: 运行抓取脚本
         run: python scrape_water_quality.py
 
-      - name: 提交并推送数据到 data 分支
+      - name: 提交并推送数据
         run: |
           git add -A "National Water Quality/"
           if git diff --cached --quiet; then
@@ -46,4 +38,4 @@ jobs:
           else
             git commit -m "水质数据更新：自动抓取"
           fi
-          git push origin data
+          git push
