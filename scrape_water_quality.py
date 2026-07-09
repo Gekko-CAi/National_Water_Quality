@@ -2,7 +2,7 @@
 """
 国家水质自动综合监管平台 - 数据抓取脚本
 从 https://szzdjc.cnemc.cn:8070/GJZ/Business/Publish/Main.html 抓取实时水质监测数据
-每2小时运行一次，数据按天保存为 CSV 文件（北京时间），每天一个文件
+GitHub Actions 每2小时运行一次，数据按天合并保存为 CSV（北京时间）
 """
 
 import os
@@ -10,9 +10,8 @@ import sys
 import re
 import csv
 import time
-import glob
 from datetime import datetime, timedelta, timezone
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 import requests
 import urllib3
@@ -26,15 +25,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ======================== 配置 ========================
 API_URL = "https://szzdjc.cnemc.cn:8070/GJZ/Ajax/Publish.ashx"
 REFERER_URL = "https://szzdjc.cnemc.cn:8070/GJZ/Business/Publish/RealDatas.html"
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "数据文件")
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "National Water Quality")
 PAGE_SIZE = 2000  # 每页记录数
 REQUEST_TIMEOUT = 60  # 请求超时秒数
 PAGE_DELAY = 2  # 每页请求间隔秒数
-
-# Git 自动提交配置
-GIT_AUTO_COMMIT = True
-GIT_AUTO_PUSH = True
-PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -49,6 +43,9 @@ WATER_QUALITY_MAP = {
     "1": "I类", "2": "II类", "3": "III类",
     "4": "IV类", "5": "V类", "6": "劣V类", "7": "未监测"
 }
+
+# 去重键：以 (监测断面, 监测时间) 作为唯一标识
+DEDUP_KEYS = ["监测断面", "监测时间"]
 
 
 # ======================== 数据抓取 ========================
@@ -187,12 +184,35 @@ def process_data(raw_data):
     return records, headers
 
 
-# ======================== CSV 按天保存 ========================
+# ======================== 读取已有 CSV ========================
+def read_existing_csv(filepath, all_headers):
+    """读取已有 CSV 文件并返回按去重键索引的记录字典"""
+    existing = OrderedDict()
+    if not os.path.exists(filepath):
+        return existing
+
+    try:
+        with open(filepath, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                key_parts = []
+                for k in DEDUP_KEYS:
+                    key_parts.append(row.get(k, "").strip())
+                key = "||".join(key_parts)
+                existing[key] = row
+        print(f"  读取已有文件: {os.path.basename(filepath)} ({len(existing)} 条)")
+    except Exception as e:
+        print(f"  [警告] 读取已有文件失败: {e}")
+
+    return existing
+
+
+# ======================== CSV 按天合并保存 ========================
 def save_daily_csv(records, headers):
     """
-    按监测时间的日期分组，每天保存为一个 CSV 文件。
+    按监测时间的日期分组，每天合并保存为一个 CSV 文件。
     文件名格式: National_Water_YYYYMMDD.csv
-    同一天的数据每次运行会覆盖（取最新抓取结果）。
+    合并策略：以 (监测断面, 监测时间) 为唯一键去重，新数据覆盖旧数据。
     """
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
@@ -210,72 +230,55 @@ def save_daily_csv(records, headers):
         daily_data[date_str].append(record)
 
     saved_files = []
-    for date_str, day_records in sorted(daily_data.items()):
+    total_new = 0  # 本次新增记录数
+    total_existing = 0  # 已有记录数
+
+    for date_str, new_records in sorted(daily_data.items()):
         date_compact = date_str.replace("-", "")
         filename = f"National_Water_{date_compact}.csv"
         filepath = os.path.join(OUTPUT_DIR, filename)
 
-        # 覆盖写入（UTF-8 BOM 编码，Excel 打开不乱码）
+        # 1. 读取已有数据
+        existing = read_existing_csv(filepath, all_headers)
+        total_existing += len(existing)
+
+        # 2. 合并新数据（以去重键覆盖已有记录）
+        added = 0
+        updated = 0
+        for record in new_records:
+            key_parts = []
+            for k in DEDUP_KEYS:
+                key_parts.append(record.get(k, "").strip())
+            key = "||".join(key_parts)
+
+            if key in existing:
+                # 已有记录：用最新抓取数据覆盖
+                existing[key] = record
+                updated += 1
+            else:
+                existing[key] = record
+                added += 1
+
+        # 3. 写入合并后的全部数据
         with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.DictWriter(f, fieldnames=all_headers)
             writer.writeheader()
-            for record in day_records:
-                writer.writerow(record)
+            for rec in existing.values():
+                writer.writerow(rec)
 
         saved_files.append(filepath)
-        print(f"  保存: {filename} ({len(day_records)} 条)")
+        total_new += len(existing)
+        print(f"  合并保存: {filename} "
+              f"(已有 {len(existing) - added - updated}, "
+              f"新增 {added}, 更新 {updated}, "
+              f"合计 {len(existing)} 条)")
 
-    return saved_files
-
-
-# ======================== Git 自动提交 ========================
-def git_commit_and_push(filepaths):
-    """自动将数据文件提交到 Git 仓库"""
-    if not GIT_AUTO_COMMIT:
-        return
-
-    import subprocess
-
-    def run_git(cmd):
-        try:
-            result = subprocess.run(
-                cmd, cwd=PROJECT_DIR, capture_output=True, text=True, timeout=30,
-                encoding="utf-8", errors="replace"
-            )
-            return result.returncode == 0, (result.stdout or "").strip(), (result.stderr or "").strip()
-        except Exception as e:
-            return False, "", str(e)
-
-    # 添加所有数据文件
-    for filepath in filepaths:
-        rel_path = os.path.relpath(filepath, PROJECT_DIR)
-        run_git(["git", "add", rel_path])
-
-    # 提交
-    timestamp = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
-    msg = f"数据更新: {timestamp}（北京时间）"
-    success, out, err = run_git(["git", "commit", "-m", msg])
-    if success:
-        summary = out.split("\n")[0] if out else "ok"
-        print(f"  [Git] {summary}")
-    else:
-        if "nothing to commit" in err:
-            print(f"  [Git] 数据无变化，跳过提交")
-        else:
-            print(f"  [Git] commit 失败: {err}")
-
-    # 推送
-    if GIT_AUTO_PUSH:
-        success, out, err = run_git(["git", "push"])
-        if success:
-            print(f"  [Git] push 成功")
-        else:
-            print(f"  [Git] push 失败: {err}")
+    return saved_files, total_new, total_existing
 
 
 # ======================== 主函数 ========================
 def main():
-    """主函数：抓取数据并按天保存为 CSV（北京时间）"""
+    """主函数：抓取数据并按天合并保存为 CSV（北京时间）"""
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
 
@@ -291,18 +294,16 @@ def main():
         print("[错误] 数据处理后为空，程序退出")
         return False
 
-    # 按天保存为 CSV
-    print(f"\n按天保存数据为 CSV（北京时间）...")
-    saved_files = save_daily_csv(records, headers)
-
-    # Git 自动提交
-    git_commit_and_push(saved_files)
+    # 按天合并保存为 CSV
+    print(f"\n按天合并保存数据为 CSV（北京时间）...")
+    saved_files, total_new, total_existing = save_daily_csv(records, headers)
 
     now_bj = datetime.now(BEIJING_TZ)
     print(f"\n{'='*60}")
     print(f"抓取完成！")
     print(f"  保存文件数: {len(saved_files)}")
-    print(f"  本次记录数: {len(records)}")
+    print(f"  本次抓取: {len(records)} 条")
+    print(f"  合并后总计: {total_new} 条")
     print(f"  抓取时间: {now_bj.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
     print(f"{'='*60}")
     return True
@@ -311,4 +312,3 @@ def main():
 if __name__ == "__main__":
     success = main()
     sys.exit(0 if success else 1)
-
