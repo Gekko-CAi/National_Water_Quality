@@ -191,7 +191,7 @@ def process_data(raw_data):
 def save_daily_csv(records, headers):
     """
     按监测时间的日期分组，每天保存为一个 CSV 文件。
-    文件名格式: 水质数据_YYYYMMDD.csv
+    文件名格式: National_Water_YYYYMMDD.csv
     同一天的数据每次运行会覆盖（取最新抓取结果）。
     """
     if not os.path.exists(OUTPUT_DIR):
@@ -212,7 +212,7 @@ def save_daily_csv(records, headers):
     saved_files = []
     for date_str, day_records in sorted(daily_data.items()):
         date_compact = date_str.replace("-", "")
-        filename = f"水质数据_{date_compact}.csv"
+        filename = f"National_Water_{date_compact}.csv"
         filepath = os.path.join(OUTPUT_DIR, filename)
 
         # 覆盖写入（UTF-8 BOM 编码，Excel 打开不乱码）
@@ -311,3 +311,4 @@ def main():
 if __name__ == "__main__":
     success = main()
     sys.exit(0 if success else 1)
+
