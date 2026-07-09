@@ -2,23 +2,22 @@
 """
 国家水质自动综合监管平台 - 数据抓取脚本
 从 https://szzdjc.cnemc.cn:8070/GJZ/Business/Publish/Main.html 抓取实时水质监测数据
-每4小时运行一次，数据保存到 Excel 文件中，每个文件保存5-10天数据
+GitHub Actions 每2小时运行一次，数据按天合并保存为 CSV（北京时间）
 """
 
 import os
 import sys
 import re
-import json
+import csv
 import time
-import glob
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
+from collections import defaultdict, OrderedDict
 
 import requests
 import urllib3
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+
+# 北京时区 UTC+8
+BEIJING_TZ = timezone(timedelta(hours=8))
 
 # 禁用 SSL 警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -26,16 +25,10 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # ======================== 配置 ========================
 API_URL = "https://szzdjc.cnemc.cn:8070/GJZ/Ajax/Publish.ashx"
 REFERER_URL = "https://szzdjc.cnemc.cn:8070/GJZ/Business/Publish/RealDatas.html"
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "数据文件")
-MAX_DAYS_PER_FILE = 10  # 每个 Excel 文件最多保存天数
-PAGE_SIZE = 2000  # 每页记录数（设大一点减少请求次数）
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "National Water Quality")
+PAGE_SIZE = 2000  # 每页记录数
 REQUEST_TIMEOUT = 60  # 请求超时秒数
-PAGE_DELAY = 2  # 每页请求间隔秒数（避免请求过快）
-
-# Git 自动提交配置
-GIT_AUTO_COMMIT = True  # 是否自动 git commit
-GIT_AUTO_PUSH = True    # 是否自动 git push（需先配置 remote）
-PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+PAGE_DELAY = 2  # 每页请求间隔秒数
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -51,37 +44,22 @@ WATER_QUALITY_MAP = {
     "4": "IV类", "5": "V类", "6": "劣V类", "7": "未监测"
 }
 
-# 水质类别颜色 (openpyxl PatternFill)
-QUALITY_COLORS = {
-    "I类": PatternFill(start_color="CCFFFF", end_color="CCFFFF", fill_type="solid"),
-    "II类": PatternFill(start_color="00CCFF", end_color="00CCFF", fill_type="solid"),
-    "III类": PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid"),
-    "IV类": PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid"),
-    "V类": PatternFill(start_color="FF9B00", end_color="FF9B00", fill_type="solid"),
-    "劣V类": PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid"),
-    "未监测": PatternFill(start_color="ABABAB", end_color="ABABAB", fill_type="solid"),
-}
+# 去重键：以 (监测断面, 监测时间) 作为唯一标识
+DEDUP_KEYS = ["监测断面", "监测时间"]
 
 
 # ======================== 数据抓取 ========================
 def parse_cell_value(html_str):
-    """
-    解析单元格 HTML 值，提取原始值和显示值。
-    格式: <span title='原始值：23.88'>23.9</span> 或 -- 或 纯文本
-    返回: (原始值, 显示值)
-    """
+    """解析单元格 HTML 值，提取原始值和显示值"""
     if not html_str or html_str == "--":
         return ("--", "--")
 
-    # 尝试提取原始值
     original_match = re.search(r"原始值[：:]\s*([\d.]+)", html_str)
-    # 尝试提取显示值（span 内的文本）
     display_match = re.search(r">([^<]+)<", html_str)
 
     original_val = original_match.group(1) if original_match else html_str
     display_val = display_match.group(1) if display_match else html_str
 
-    # 清理 HTML 标签
     if "<" in original_val:
         original_val = re.sub(r"<[^>]+>", "", original_val)
     if "<" in display_val:
@@ -94,9 +72,7 @@ def parse_thead(thead_list):
     """解析表头，提取干净的列名"""
     clean_headers = []
     for h in thead_list:
-        # 移除 HTML 标签
         clean = re.sub(r"<[^>]+>", "", h)
-        # 移除多余空白
         clean = re.sub(r"\s+", " ", clean).strip()
         clean_headers.append(clean)
     return clean_headers
@@ -138,9 +114,9 @@ def fetch_page(page_index, page_size=PAGE_SIZE, max_retries=3):
 
 def fetch_all_data():
     """抓取所有页的数据"""
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 开始抓取水质监测数据...")
+    now_bj = datetime.now(BEIJING_TZ)
+    print(f"[{now_bj.strftime('%Y-%m-%d %H:%M:%S')}] 开始抓取水质监测数据（北京时间）...")
 
-    # 第一页
     first_page = fetch_page(1)
     if not first_page:
         print("[错误] 第一页数据抓取失败，无法继续")
@@ -155,7 +131,6 @@ def fetch_all_data():
     print(f"  总记录数: {total_records}, 总页数: {total_pages}")
     print(f"  表头列: {clean_headers}")
 
-    # 抓取剩余页
     for page_idx in range(2, total_pages + 1):
         print(f"  正在抓取第 {page_idx}/{total_pages} 页...")
         time.sleep(PAGE_DELAY)
@@ -171,16 +146,13 @@ def fetch_all_data():
 
 # ======================== 数据处理 ========================
 def process_data(raw_data):
-    """
-    将原始数据解析为结构化记录列表。
-    每条记录是一个 dict，包含所有字段。
-    """
+    """将原始数据解析为结构化记录列表"""
     headers = raw_data["headers"]
     rows = raw_data["data"]
     records = []
 
-    # 解析监测时间，添加年份
-    current_year = datetime.now().year
+    # 使用北京时间的年份
+    current_year = datetime.now(BEIJING_TZ).year
 
     for row in rows:
         record = {}
@@ -195,9 +167,8 @@ def process_data(raw_data):
                 record[col_name] = quality_level
             elif i >= 5:  # 监测指标值（含 HTML）
                 original, display = parse_cell_value(val)
-                record[col_name] = original  # 使用原始值
+                record[col_name] = original
             elif i == 3:  # 监测时间
-                # 格式: "07-01 20:00" -> 添加年份
                 time_str = str(val).strip()
                 if time_str and time_str != "--":
                     record[col_name] = f"{current_year}-{time_str}"
@@ -206,242 +177,108 @@ def process_data(raw_data):
             else:
                 record[col_name] = str(val).strip() if val else ""
 
-        # 添加抓取时间戳
-        record["抓取时间"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 抓取时间用北京时间
+        record["抓取时间"] = datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")
         records.append(record)
 
     return records, headers
 
 
-# ======================== Excel 管理 ========================
-def get_excel_files():
-    """获取输出目录中所有 Excel 文件，按修改时间排序"""
+# ======================== 读取已有 CSV ========================
+def read_existing_csv(filepath, all_headers):
+    """读取已有 CSV 文件并返回按去重键索引的记录字典"""
+    existing = OrderedDict()
+    if not os.path.exists(filepath):
+        return existing
+
+    try:
+        with open(filepath, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                key_parts = []
+                for k in DEDUP_KEYS:
+                    key_parts.append(row.get(k, "").strip())
+                key = "||".join(key_parts)
+                existing[key] = row
+        print(f"  读取已有文件: {os.path.basename(filepath)} ({len(existing)} 条)")
+    except Exception as e:
+        print(f"  [警告] 读取已有文件失败: {e}")
+
+    return existing
+
+
+# ======================== CSV 按天合并保存 ========================
+def save_daily_csv(records, headers):
+    """
+    按监测时间的日期分组，每天合并保存为一个 CSV 文件。
+    文件名格式: National_Water_YYYYMMDD.csv
+    合并策略：以 (监测断面, 监测时间) 为唯一键去重，新数据覆盖旧数据。
+    """
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
-        return []
 
-    files = glob.glob(os.path.join(OUTPUT_DIR, "国控断面水质_*.xlsx"))
-    files.sort(key=os.path.getmtime, reverse=True)
-    return files
-
-
-def get_file_date_range(filepath):
-    """从 Excel 文件名解析日期范围"""
-    basename = os.path.basename(filepath)
-    # 文件名格式: 国控断面水质_20250701_20250705.xlsx
-    match = re.match(r"国控断面水质_(\d{8})_(\d{8})\.xlsx", basename)
-    if match:
-        start_str, end_str = match.groups()
-        try:
-            start_date = datetime.strptime(start_str, "%Y%m%d")
-            end_date = datetime.strptime(end_str, "%Y%m%d")
-            return start_date, end_date
-        except ValueError:
-            pass
-    return None, None
-
-
-def find_or_create_excel(records, headers):
-    """
-    查找当前应使用的 Excel 文件，或创建新文件。
-    规则:
-    - 如果最新文件的日期跨度 < MAX_DAYS_PER_FILE 天，追加数据
-    - 否则创建新文件
-    """
-    files = get_excel_files()
-    today = datetime.now().strftime("%Y%m%d")
-
-    if files:
-        latest_file = files[0]
-        start_date, end_date = get_file_date_range(latest_file)
-
-        if start_date and end_date:
-            days_span = (end_date - start_date).days + 1
-            if days_span < MAX_DAYS_PER_FILE:
-                # 追加到现有文件
-                print(f"  追加数据到现有文件: {os.path.basename(latest_file)} (已跨{days_span}天)")
-                append_to_excel(latest_file, records, headers)
-                # 更新文件名中的结束日期
-                new_end_date = datetime.now().strftime("%Y%m%d")
-                if new_end_date != end_date.strftime("%Y%m%d"):
-                    new_name = os.path.join(OUTPUT_DIR,
-                        f"国控断面水质_{start_date.strftime('%Y%m%d')}_{new_end_date}.xlsx")
-                    os.rename(latest_file, new_name)
-                    print(f"  文件重命名为: {os.path.basename(new_name)}")
-                    return new_name
-                return latest_file
-
-    # 创建新文件
-    filename = f"国控断面水质_{today}_{today}.xlsx"
-    filepath = os.path.join(OUTPUT_DIR, filename)
-    print(f"  创建新文件: {filename}")
-    create_new_excel(filepath, records, headers)
-    return filepath
-
-
-def create_new_excel(filepath, records, headers):
-    """创建新的 Excel 文件并写入数据"""
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "水质监测数据"
-
-    # 添加表头
-    all_headers = list(headers) + ["抓取时间"]
-    write_header_row(ws, all_headers)
-
-    # 写入数据
-    for row_idx, record in enumerate(records, start=2):
-        write_data_row(ws, row_idx, record, all_headers)
-
-    # 设置样式
-    apply_styles(ws, len(all_headers), len(records) + 1)
-
-    # 冻结首行
-    ws.freeze_panes = "A2"
-
-    wb.save(filepath)
-    print(f"  数据已保存: {filepath} (共{len(records)}条记录)")
-
-
-def append_to_excel(filepath, records, headers):
-    """追加数据到现有 Excel 文件"""
-    wb = load_workbook(filepath)
-    ws = wb.active
-
-    # 找到最后一行
-    max_row = ws.max_row
     all_headers = list(headers) + ["抓取时间"]
 
-    # 检查表头是否匹配
-    existing_headers = [cell.value for cell in ws[1]]
-    if existing_headers != all_headers:
-        print(f"  [警告] 表头不匹配，将使用新表头")
-        # 如果表头不匹配，需要处理
-        # 这里简单处理：如果新表头更多，补充列
-        if len(all_headers) > len(existing_headers):
-            for i in range(len(existing_headers), len(all_headers)):
-                ws.cell(row=1, column=i+1, value=all_headers[i])
-
-    # 写入数据
-    for row_idx, record in enumerate(records, start=max_row + 1):
-        write_data_row(ws, row_idx, record, all_headers)
-
-    wb.save(filepath)
-    total = ws.max_row - 1
-    print(f"  数据已追加: {filepath} (当前共{total}条记录)")
-
-
-def write_header_row(ws, headers):
-    """写入表头行"""
-    header_font = Font(name="微软雅黑", size=10, bold=True, color="FFFFFF")
-    header_fill = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
-    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    thin_border = Border(
-        left=Side(style='thin'), right=Side(style='thin'),
-        top=Side(style='thin'), bottom=Side(style='thin')
-    )
-
-    for col_idx, header in enumerate(headers, start=1):
-        cell = ws.cell(row=1, column=col_idx, value=header)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = header_align
-        cell.border = thin_border
-
-
-def write_data_row(ws, row_idx, record, headers):
-    """写入一行数据"""
-    data_font = Font(name="微软雅黑", size=9)
-    data_align = Alignment(horizontal="center", vertical="center")
-    thin_border = Border(
-        left=Side(style='thin'), right=Side(style='thin'),
-        top=Side(style='thin'), bottom=Side(style='thin')
-    )
-
-    for col_idx, header in enumerate(headers, start=1):
-        value = record.get(header, "")
-        cell = ws.cell(row=row_idx, column=col_idx, value=value)
-        cell.font = data_font
-        cell.alignment = data_align
-        cell.border = thin_border
-
-        # 水质类别着色
-        if header == "水质类别" and value in QUALITY_COLORS:
-            cell.fill = QUALITY_COLORS[value]
-
-
-def apply_styles(ws, num_cols, num_rows):
-    """设置列宽等样式"""
-    col_widths = {
-        "省份": 10, "流域": 12, "断面名称": 16, "监测时间": 16,
-        "水质类别": 10, "抓取时间": 20,
-    }
-    for col_idx in range(1, num_cols + 1):
-        header_val = ws.cell(row=1, column=col_idx).value
-        width = 12  # 默认宽度
-        for key, w in col_widths.items():
-            if header_val and key in str(header_val):
-                width = w
-                break
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
-
-    ws.row_dimensions[1].height = 35
-
-
-# ======================== Git 自动提交 ========================
-def git_commit_and_push(filepath):
-    """自动将数据文件提交到 Git 仓库，可选推送到远程"""
-    if not GIT_AUTO_COMMIT:
-        return
-
-    import subprocess
-
-    def run_git(cmd):
-        try:
-            result = subprocess.run(
-                cmd, cwd=PROJECT_DIR, capture_output=True, text=True, timeout=30,
-                encoding='utf-8', errors='replace'
-            )
-            return result.returncode == 0, (result.stdout or "").strip(), (result.stderr or "").strip()
-        except Exception as e:
-            return False, "", str(e)
-
-    # 添加文件
-    rel_path = os.path.relpath(filepath, PROJECT_DIR)
-    success, out, err = run_git(["git", "add", rel_path])
-    if not success and err:
-        print(f"  [Git] add 失败: {err}")
-        return
-
-    # 提交
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    msg = f"数据更新: {timestamp} — {os.path.basename(filepath)}"
-    success, out, err = run_git(["git", "commit", "-m", msg])
-    if success:
-        # 只显示摘要行
-        summary = out.split("\n")[0] if out else "ok"
-        print(f"  [Git] {summary}")
-    else:
-        # "nothing to commit" 不是错误
-        if "nothing to commit" in err:
-            print(f"  [Git] 数据无变化，跳过提交")
+    # 按监测时间日期分组
+    daily_data = defaultdict(list)
+    for record in records:
+        time_val = str(record.get("监测时间", ""))
+        if time_val and time_val != "--" and len(time_val) >= 10:
+            date_str = time_val[:10]  # "2026-07-09"
         else:
-            print(f"  [Git] commit 失败: {err}")
+            date_str = "未知日期"
+        daily_data[date_str].append(record)
 
-    # 推送
-    if GIT_AUTO_PUSH:
-        success, out, err = run_git(["git", "push"])
-        if success:
-            print(f"  [Git] push 成功")
-        else:
-            print(f"  [Git] push 失败: {err}")
-            print(f"  [Git] 提示: 先配置 remote: git remote add origin <仓库地址>")
+    saved_files = []
+    total_new = 0  # 本次新增记录数
+    total_existing = 0  # 已有记录数
+
+    for date_str, new_records in sorted(daily_data.items()):
+        date_compact = date_str.replace("-", "")
+        filename = f"National_Water_{date_compact}.csv"
+        filepath = os.path.join(OUTPUT_DIR, filename)
+
+        # 1. 读取已有数据
+        existing = read_existing_csv(filepath, all_headers)
+        total_existing += len(existing)
+
+        # 2. 合并新数据（以去重键覆盖已有记录）
+        added = 0
+        updated = 0
+        for record in new_records:
+            key_parts = []
+            for k in DEDUP_KEYS:
+                key_parts.append(record.get(k, "").strip())
+            key = "||".join(key_parts)
+
+            if key in existing:
+                # 已有记录：用最新抓取数据覆盖
+                existing[key] = record
+                updated += 1
+            else:
+                existing[key] = record
+                added += 1
+
+        # 3. 写入合并后的全部数据
+        with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=all_headers)
+            writer.writeheader()
+            for rec in existing.values():
+                writer.writerow(rec)
+
+        saved_files.append(filepath)
+        total_new += len(existing)
+        print(f"  合并保存: {filename} "
+              f"(已有 {len(existing) - added - updated}, "
+              f"新增 {added}, 更新 {updated}, "
+              f"合计 {len(existing)} 条)")
+
+    return saved_files, total_new, total_existing
 
 
 # ======================== 主函数 ========================
 def main():
-    """主函数：抓取数据并保存到 Excel"""
-    # 确保输出目录存在
+    """主函数：抓取数据并按天合并保存为 CSV（北京时间）"""
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
 
@@ -457,18 +294,17 @@ def main():
         print("[错误] 数据处理后为空，程序退出")
         return False
 
-    # 保存到 Excel
-    print(f"\n正在保存数据到 Excel...")
-    filepath = find_or_create_excel(records, headers)
+    # 按天合并保存为 CSV
+    print(f"\n按天合并保存数据为 CSV（北京时间）...")
+    saved_files, total_new, total_existing = save_daily_csv(records, headers)
 
-    # Git 自动提交
-    git_commit_and_push(filepath)
-
+    now_bj = datetime.now(BEIJING_TZ)
     print(f"\n{'='*60}")
     print(f"抓取完成！")
-    print(f"  数据文件: {filepath}")
-    print(f"  本次记录数: {len(records)}")
-    print(f"  抓取时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"  保存文件数: {len(saved_files)}")
+    print(f"  本次抓取: {len(records)} 条")
+    print(f"  合并后总计: {total_new} 条")
+    print(f"  抓取时间: {now_bj.strftime('%Y-%m-%d %H:%M:%S')} (北京时间)")
     print(f"{'='*60}")
     return True
 

@@ -1,0 +1,41 @@
+name: 水质数据抓取
+
+on:
+  schedule:
+    # 每2小时运行一次（UTC 奇数整点，对应北京时间奇数整点 01:00/03:00/.../23:00）
+    - cron: '0 1-23/2 * * *'
+  workflow_dispatch: # 支持手动触发
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout 主分支
+        uses: actions/checkout@v4
+
+      - name: 配置 Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装依赖
+        run: pip install requests urllib3
+
+      - name: 运行抓取脚本
+        run: python scrape_water_quality.py
+
+      - name: 提交并推送数据
+        run: |
+          git add -A "National Water Quality/"
+          if git diff --cached --quiet; then
+            echo "无新数据，跳过提交"
+          else
+            git commit -m "水质数据更新：自动抓取"
+          fi
+          git push
