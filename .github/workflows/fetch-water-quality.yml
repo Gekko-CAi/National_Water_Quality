@@ -21,7 +21,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: 切换到 data 分支
+      - name: 切换到 data 分支并同步最新脚本
         run: |
           git fetch origin
           if git ls-remote --heads origin data | grep -q .; then
@@ -29,6 +29,8 @@ jobs:
           else
             git checkout -b data
           fi
+          # 从 main 分支获取最新脚本（脚本只在 main 维护）
+          git checkout main -- scrape_water_quality.py
 
       - uses: actions/setup-python@v5
         with:
