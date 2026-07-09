@@ -1,0 +1,40 @@
+name: 水质数据抓取
+
+on:
+  schedule:
+    # 每2小时运行一次（UTC 时间）
+    - cron: '0 */2 * * *'
+  workflow_dispatch: # 支持手动触发
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 配置 Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装依赖
+        run: pip install requests urllib3 openpyxl
+
+      - name: 运行抓取脚本
+        run: python scrape_water_quality.py
+
+      - name: 推送数据到仓库
+        run: |
+          if git log --format=%H origin/${{ github.ref_name }}..HEAD | grep -q .; then
+            echo "检测到新提交，正在推送..."
+            git push origin HEAD
+            echo "推送完成"
+          else
+            echo "无新数据提交，跳过推送"
+          fi
