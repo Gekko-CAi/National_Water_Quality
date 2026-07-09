@@ -13,11 +13,22 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: 配置 Git
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: 切换到 data 分支
+        run: |
+          git fetch origin
+          if git ls-remote --heads origin data | grep -q .; then
+            git checkout -B data origin/data
+          else
+            git checkout -b data
+          fi
 
       - uses: actions/setup-python@v5
         with:
@@ -32,16 +43,15 @@ jobs:
       - name: 清理旧数据文件（只保留最新一份）
         run: |
           cd 数据文件
-          # 按文件修改时间倒序排列，保留第一个（最新），删除其余
           ls -t *.xlsx 2>/dev/null | tail -n +2 | xargs -r rm -f
           cd ..
 
-      - name: 提交并推送清理后的变更
+      - name: 提交并推送变更到 data 分支
         run: |
           git add -A 数据文件/
           if git diff --cached --quiet; then
             echo "无变化，跳过提交"
           else
-            git commit -m "清理历史水质数据文件，只保留最新一份"
-            git push origin HEAD
+            git commit -m "水质数据更新：清理历史文件，保留最新一份"
           fi
+          git push origin HEAD:data
